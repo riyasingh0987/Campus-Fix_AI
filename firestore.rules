@@ -1,0 +1,134 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userData(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    function isAdmin() {
+      return signedIn() && userData(request.auth.uid).role == 'admin';
+    }
+
+    function isStudent() {
+      return signedIn() && userData(request.auth.uid).role == 'student';
+    }
+
+    function validCategory(category) {
+      return category in [
+        'Electricity', 'Water', 'Wi-Fi', 'Hostel', 'Cleanliness',
+        'Infrastructure', 'Other'
+      ];
+    }
+
+    function validPriority(priority) {
+      return priority in ['Low', 'Medium', 'High', 'Critical'];
+    }
+
+    function validStatus(status) {
+      return status in ['Pending', 'Approved', 'In Progress', 'Resolved', 'Rejected'];
+    }
+
+    function validTransition(fromStatus, toStatus) {
+      return (fromStatus == 'Pending' && toStatus in ['Approved', 'Rejected'])
+        || (fromStatus == 'Approved' && toStatus == 'In Progress')
+        || (fromStatus == 'In Progress' && toStatus == 'Resolved');
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['uid', 'name', 'email', 'role', 'createdAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.name is string
+        && request.resource.data.email is string
+        && request.resource.data.role in ['student', 'admin']
+        && request.resource.data.createdAt == request.time;
+
+      // Clients can edit their own contact details, but never their role or identity.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'email']);
+
+      allow delete: if false;
+    }
+
+    match /complaints/{complaintId} {
+      allow read: if signedIn()
+        && (isAdmin() || resource.data.studentId == request.auth.uid);
+
+      allow create: if isStudent()
+        && request.resource.data.keys().hasOnly([
+          'id', 'studentId', 'studentName', 'studentEmail', 'category', 'title',
+          'description', 'location', 'imageUrl', 'priority', 'status',
+          'aiSuggestedCategory', 'adminRemark', 'statusHistory', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.id == complaintId
+        && request.resource.data.studentId == request.auth.uid
+        && request.resource.data.studentName == userData(request.auth.uid).name
+        && request.resource.data.studentEmail == userData(request.auth.uid).email
+        && validCategory(request.resource.data.category)
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 120
+        && request.resource.data.description is string
+        && request.resource.data.description.size() >= 15
+        && request.resource.data.description.size() <= 2000
+        && request.resource.data.location is string
+        && request.resource.data.location.size() > 0
+        && request.resource.data.location.size() <= 160
+        && request.resource.data.priority == 'Medium'
+        && request.resource.data.status == 'Pending'
+        && request.resource.data.statusHistory is list
+        && request.resource.data.statusHistory.size() == 1
+        && request.resource.data.statusHistory[0].status == 'Pending'
+        && request.resource.data.statusHistory[0].updatedBy == request.auth.uid
+        && request.resource.data.statusHistory[0].updatedByName == userData(request.auth.uid).name
+        && request.resource.data.statusHistory[0].timestamp is timestamp
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+
+      function validPriorityUpdate() {
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['priority', 'updatedAt'])
+          && validPriority(request.resource.data.priority)
+          && request.resource.data.updatedAt == request.time;
+      }
+
+      function validStatusUpdate() {
+        let oldHistory = resource.data.statusHistory;
+        let newHistory = request.resource.data.statusHistory;
+        let newEntry = newHistory[newHistory.size() - 1];
+        let nextStatus = request.resource.data.status;
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'adminRemark', 'statusHistory', 'updatedAt'
+          ])
+          && validStatus(nextStatus)
+          && validTransition(resource.data.status, nextStatus)
+          && newHistory is list
+          // Preserve every previous event and allow exactly one appended transition.
+          && newHistory.size() == oldHistory.size() + 1
+          && newHistory.hasAll(oldHistory)
+          && newEntry.status == nextStatus
+          && newEntry.updatedBy == request.auth.uid
+          && newEntry.updatedByName == userData(request.auth.uid).name
+          && newEntry.remark is string
+          && newEntry.timestamp is timestamp
+          && request.resource.data.adminRemark == newEntry.remark
+          && ((nextStatus != 'Rejected' && nextStatus != 'Resolved') || newEntry.remark.size() > 0)
+          && request.resource.data.updatedAt == request.time;
+      }
+
+      allow update: if isAdmin() && (validPriorityUpdate() || validStatusUpdate());
+      allow delete: if false;
+    }
+  }
+}
